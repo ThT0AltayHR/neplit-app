@@ -33,7 +33,7 @@ jobs:
           echo "$HOME/apktool" >> $GITHUB_PATH
           echo "apktool kuruldu: $(java -jar $HOME/apktool/apktool.jar --version)"
 
-      - name: Android SDK build-tools kur (aapt2, zipalign, apksigner için)
+      - name: Android SDK build-tools kur
         uses: android-actions/setup-android@v3
 
       - name: build-tools araçlarını PATH'e ekle
@@ -56,12 +56,44 @@ jobs:
           cd neplit_build
           apktool b . --output ../neplit-raw.apk --use-aapt2
           cd ..
-          ls -lh neplit-raw.apk
+          echo "Ham APK boyutu: $(ls -lh neplit-raw.apk)"
+
+      - name: APK'yı temiz ZIP olarak yeniden paketle (extra-field düzelt)
+        run: |
+          # apktool bazı dosyaları orijinalden kopyalarken bozuk ZIP extra-field bırakır.
+          # Android bu durumda APK'yı parse edemez. Yeniden paketleyerek temizliyoruz.
+          mkdir -p apk_repacked
+          unzip -q neplit-raw.apk -d apk_repacked/
+          echo "Çıkarılan dosya sayısı: $(find apk_repacked -type f | wc -l)"
+
+          # Temiz ZIP oluştur - extra-field/UID/GID bilgisi olmadan
+          cd apk_repacked
+
+          # resources.arsc mutlaka STORED (sıkıştırılmamış) olmalı - Android bunu bellekle eşler
+          zip -0 -X ../neplit-clean.apk resources.arsc
+          echo "resources.arsc eklendi (STORED)"
+
+          # Geri kalan tüm dosyalar - DEX dosyaları ve büyük binary dosyalar için düşük sıkıştırma
+          find . -type f ! -name "resources.arsc" | sort | while read f; do
+            fname="${f#./}"
+            # DEX, binary asset, native lib, resim - STORED bırak (daha hızlı yükleme)
+            if echo "$fname" | grep -qE '\.(dex|so|webp|png|jpg|gif|tflite|binarypb|profm|prof|bundle)$'; then
+              zip -0 -X ../neplit-clean.apk "$fname"
+            else
+              zip -9 -X ../neplit-clean.apk "$fname"
+            fi
+          done
+
+          cd ..
+          echo "Temiz APK boyutu: $(ls -lh neplit-clean.apk)"
+          echo "ZIP bütünlük kontrolü:"
+          unzip -t neplit-clean.apk 2>&1 | grep -E "error|Error|bad" || echo "Hata yok - ZIP temiz"
 
       - name: zipalign uygula
         run: |
-          zipalign -v -p 4 neplit-raw.apk neplit-aligned.apk
-          echo "zipalign tamam"
+          zipalign -v -p 4 neplit-clean.apk neplit-aligned.apk
+          echo "zipalign doğrulama:"
+          zipalign -c -v 4 neplit-aligned.apk && echo "HIZALANMA TAMAM" || echo "HIZALANMA HATASI"
           ls -lh neplit-aligned.apk
 
       - name: Keystore oluştur ve apksigner ile imzala (v1+v2+v3)
@@ -85,8 +117,9 @@ jobs:
             --out neplit-signed.apk \
             neplit-aligned.apk
 
-          apksigner verify --verbose neplit-signed.apk
-          ls -lh neplit-signed.apk
+          echo "=== İmza Doğrulama ==="
+          apksigner verify --verbose --print-certs neplit-signed.apk
+          echo "Son APK boyutu: $(ls -lh neplit-signed.apk)"
 
       - name: Versiyon etiketini belirle
         id: version
@@ -104,7 +137,7 @@ jobs:
             ## Neplit APK - Otomatik Derleme
 
             Bu APK GitHub Actions tarafından otomatik olarak derlenmiştir.
-            İmzalama: apksigner (v1 + v2 + v3) — Android 7.0+ uyumlu
+            Derleme: apktool 2.9.3 + aapt2 + ZIP repack + zipalign + apksigner (v1+v2+v3)
 
             ### Kurulum
             1. `neplit-signed.apk` dosyasını indirin
@@ -114,6 +147,8 @@ jobs:
             ### Paket Bilgileri
             - Paket: `com.neplit.app`
             - Min Android: 7.0 (API 24)
+            - Hedef SDK: Android 16 (API 36)
+            - Sürüm: 2.193.0
           files: neplit-signed.apk
           draft: false
           prerelease: false
