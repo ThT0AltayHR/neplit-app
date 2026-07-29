@@ -19,11 +19,25 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: apktool kur
+      - name: apktool 2.9.3 kur (GitHub releases)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y apktool
-          echo "apktool: $(apktool --version)"
+          mkdir -p $HOME/apktool
+          curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
+            -o $HOME/apktool/apktool.jar
+          curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+            -o $HOME/apktool/apktool
+          chmod +x $HOME/apktool/apktool
+          echo "$HOME/apktool" >> $GITHUB_PATH
+          echo "apktool kuruldu: $(java -jar $HOME/apktool/apktool.jar --version)"
+
+      - name: Android SDK build-tools kur (aapt2 için)
+        uses: android-actions/setup-android@v3
+
+      - name: aapt2 PATH'e ekle
+        run: |
+          AAPT2=$(find $ANDROID_HOME/build-tools -name "aapt2" | sort -V | tail -1)
+          echo "Bulunan aapt2: $AAPT2"
+          echo "$(dirname $AAPT2)" >> $GITHUB_PATH
 
       - name: Release'ten APK kaynak zip'i indir
         run: |
@@ -31,9 +45,10 @@ jobs:
             "https://github.com/${{ github.repository }}/releases/download/source-v1/neplit_source.zip" \
             -o neplit_source.zip
           unzip -q neplit_source.zip
+          echo "Kaynak dosyalar:"
           ls -la neplit_build/
 
-      - name: APK derle
+      - name: APK derle (apktool + Android SDK aapt2)
         run: |
           cd neplit_build
           apktool b . --output ../neplit-unsigned.apk --use-aapt2
