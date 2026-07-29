@@ -31,72 +31,26 @@ jobs:
             -o $HOME/apktool/apktool
           chmod +x $HOME/apktool/apktool
           echo "$HOME/apktool" >> $GITHUB_PATH
-          echo "apktool kuruldu: $(java -jar $HOME/apktool/apktool.jar --version)"
 
       - name: Android SDK build-tools kur
         uses: android-actions/setup-android@v3
 
-      - name: build-tools araçlarını PATH'e ekle
+      - name: build-tools PATH'e ekle
         run: |
           BT=$(find $ANDROID_HOME/build-tools -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
-          echo "Kullanılan build-tools: $BT"
+          echo "Build-tools: $BT"
           echo "$BT" >> $GITHUB_PATH
 
-      - name: Release'ten APK kaynak zip'i indir
+      - name: Kaynak zip'i indir ve çıkar
         run: |
           curl -L \
             "https://github.com/${{ github.repository }}/releases/download/source-v1/neplit_source.zip" \
             -o neplit_source.zip
           unzip -q neplit_source.zip
-          echo "Kaynak dosyalar:"
-          ls -la neplit_build/
+          echo "Kaynak hazır: $(ls neplit_build/)"
 
-      - name: APK derle (apktool + aapt2)
-        run: |
-          cd neplit_build
-          apktool b . --output ../neplit-raw.apk --use-aapt2
-          cd ..
-          echo "Ham APK boyutu: $(ls -lh neplit-raw.apk)"
-
-      - name: APK'yı temiz ZIP olarak yeniden paketle (extra-field düzelt)
-        run: |
-          # apktool bazı dosyaları orijinalden kopyalarken bozuk ZIP extra-field bırakır.
-          # Android bu durumda APK'yı parse edemez. Yeniden paketleyerek temizliyoruz.
-          mkdir -p apk_repacked
-          unzip -q neplit-raw.apk -d apk_repacked/
-          echo "Çıkarılan dosya sayısı: $(find apk_repacked -type f | wc -l)"
-
-          # Temiz ZIP oluştur - extra-field/UID/GID bilgisi olmadan
-          cd apk_repacked
-
-          # resources.arsc mutlaka STORED (sıkıştırılmamış) olmalı - Android bunu bellekle eşler
-          zip -0 -X ../neplit-clean.apk resources.arsc
-          echo "resources.arsc eklendi (STORED)"
-
-          # Geri kalan tüm dosyalar - DEX dosyaları ve büyük binary dosyalar için düşük sıkıştırma
-          find . -type f ! -name "resources.arsc" | sort | while read f; do
-            fname="${f#./}"
-            # DEX, binary asset, native lib, resim - STORED bırak (daha hızlı yükleme)
-            if echo "$fname" | grep -qE '\.(dex|so|webp|png|jpg|gif|tflite|binarypb|profm|prof|bundle)$'; then
-              zip -0 -X ../neplit-clean.apk "$fname"
-            else
-              zip -9 -X ../neplit-clean.apk "$fname"
-            fi
-          done
-
-          cd ..
-          echo "Temiz APK boyutu: $(ls -lh neplit-clean.apk)"
-          echo "ZIP bütünlük kontrolü:"
-          unzip -t neplit-clean.apk 2>&1 | grep -E "error|Error|bad" || echo "Hata yok - ZIP temiz"
-
-      - name: zipalign uygula
-        run: |
-          zipalign -v -p 4 neplit-clean.apk neplit-aligned.apk
-          echo "zipalign doğrulama:"
-          zipalign -c -v 4 neplit-aligned.apk && echo "HIZALANMA TAMAM" || echo "HIZALANMA HATASI"
-          ls -lh neplit-aligned.apk
-
-      - name: Keystore oluştur ve apksigner ile imzala (v1+v2+v3)
+      # ─── Keystore bir kez oluştur ───────────────────────────────────────────
+      - name: Keystore oluştur
         run: |
           keytool -genkey -v \
             -keystore neplit.keystore \
@@ -104,8 +58,94 @@ jobs:
             -keyalg RSA -keysize 2048 \
             -validity 10000 \
             -storepass android -keypass android \
-            -dname "CN=Neplit, OU=Dev, O=Neplit, L=TR, ST=TR, C=TR"
+            -dname "CN=Neplit,OU=Dev,O=Neplit,L=TR,ST=TR,C=TR"
 
+      # ─── Python repack scripti ──────────────────────────────────────────────
+      - name: Python repack scriptini hazırla
+        run: |
+          cat > /tmp/repack.py << 'PYEOF'
+          import zipfile, os, sys
+
+          input_apk  = sys.argv[1]
+          output_apk = sys.argv[2]
+
+          # Android gereksinimleri:
+          #   resources.arsc  → STORED (memory-map için şarttır)
+          #   .dex            → STORED (uyumluluk için)
+          #   .so             → STORED (Android 6+ extract zorunlu)
+          #   diğer binary    → STORED
+          #   metin/XML       → DEFLATED
+          STORE_NAMES = {'resources.arsc'}
+          STORE_EXTS  = {
+              '.dex', '.so', '.png', '.webp', '.jpg', '.jpeg', '.gif',
+              '.bmp', '.tflite', '.profm', '.prof', '.bundle', '.binarypb',
+              '.mp4', '.mp3', '.ogg', '.wav', '.ttf', '.otf', '.pem',
+          }
+
+          with zipfile.ZipFile(input_apk, 'r') as zin:
+              infos = zin.infolist()
+              print(f"Girdi: {len(infos)} dosya, {os.path.getsize(input_apk)} byte")
+
+              # resources.arsc en başta olsun
+              infos.sort(key=lambda x: (
+                  0 if x.filename == 'resources.arsc' else 1,
+                  x.filename
+              ))
+
+              with zipfile.ZipFile(output_apk, 'w', allowZip64=False) as zout:
+                  for info in infos:
+                      data = zin.read(info.filename)
+
+                      # Tamamen temiz ZipInfo - extra field YOK
+                      new = zipfile.ZipInfo(info.filename)
+                      new.date_time = (2024, 1, 1, 0, 0, 0)
+                      new.extra     = b''      # ← tüm extra field'ları sil
+                      new.comment   = b''
+                      new.flag_bits = 0
+
+                      bname = os.path.basename(info.filename)
+                      ext   = os.path.splitext(bname)[1].lower()
+
+                      if bname in STORE_NAMES or ext in STORE_EXTS:
+                          new.compress_type = zipfile.ZIP_STORED
+                      else:
+                          new.compress_type = zipfile.ZIP_DEFLATED
+
+                      zout.writestr(new, data)
+
+          out_size = os.path.getsize(output_apk)
+          print(f"Çıktı: {out_size} byte ({out_size/1024/1024:.1f} MB)")
+          print("Repack tamamlandı.")
+          PYEOF
+          echo "Python scripti hazır."
+
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # VARIANT A: apktool --use-aapt2 (standart yol)
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: "[A] apktool --use-aapt2 ile derle"
+        run: |
+          cp -r neplit_build neplit_build_A
+          cd neplit_build_A
+          apktool b . --output ../raw_A.apk --use-aapt2 2>&1 | tail -5
+          cd ..
+          ls -lh raw_A.apk
+
+      - name: "[A] Python ile temiz ZIP oluştur"
+        run: |
+          python3 /tmp/repack.py raw_A.apk clean_A.apk
+          # ZIP bütünlük kontrolü
+          python3 -c "
+          import zipfile
+          with zipfile.ZipFile('clean_A.apk','r') as z:
+              bad = z.testzip()
+              print('ZIP test:', 'TAMAM' if bad is None else f'HATA: {bad}')
+              print('Dosya sayısı:', len(z.infolist()))
+          "
+
+      - name: "[A] zipalign + apksigner"
+        run: |
+          zipalign -f -v -p 4 clean_A.apk aligned_A.apk
+          zipalign -c -v 4 aligned_A.apk && echo "A: zipalign TAMAM" || echo "A: zipalign HATA"
           apksigner sign \
             --ks neplit.keystore \
             --ks-key-alias neplit \
@@ -114,50 +154,186 @@ jobs:
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            --out neplit-signed.apk \
-            neplit-aligned.apk
+            --out variant_A.apk \
+            aligned_A.apk
+          apksigner verify --verbose variant_A.apk 2>&1 | grep -E "Verifies|v[123]|Error"
+          ls -lh variant_A.apk
 
-          echo "=== İmza Doğrulama ==="
-          apksigner verify --verbose --print-certs neplit-signed.apk
-          echo "Son APK boyutu: $(ls -lh neplit-signed.apk)"
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # VARIANT B: --copy-original (orijinal binary manifest kullan)
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: "[B] apktool --copy-original ile derle (orijinal manifest)"
+        run: |
+          cp -r neplit_build neplit_build_B
+          cd neplit_build_B
+          apktool b . --output ../raw_B.apk --use-aapt2 --copy-original 2>&1 | tail -5
+          cd ..
+          ls -lh raw_B.apk
 
-      - name: Versiyon etiketini belirle
+      - name: "[B] Python ile temiz ZIP + META-INF temizle"
+        run: |
+          python3 /tmp/repack.py raw_B.apk clean_B.apk
+          python3 -c "
+          import zipfile
+          with zipfile.ZipFile('clean_B.apk','r') as z:
+              bad = z.testzip()
+              print('ZIP test:', 'TAMAM' if bad is None else f'HATA: {bad}')
+          "
+
+      - name: "[B] zipalign + apksigner"
+        run: |
+          zipalign -f -v -p 4 clean_B.apk aligned_B.apk
+          zipalign -c -v 4 aligned_B.apk && echo "B: zipalign TAMAM" || echo "B: zipalign HATA"
+          apksigner sign \
+            --ks neplit.keystore \
+            --ks-key-alias neplit \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out variant_B.apk \
+            aligned_B.apk
+          apksigner verify --verbose variant_B.apk 2>&1 | grep -E "Verifies|v[123]|Error"
+          ls -lh variant_B.apk
+
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # VARIANT C: apktool aapt2 YOK (eski aapt ile kaynak derleme)
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: "[C] apktool (aapt2 olmadan) ile derle"
+        run: |
+          cp -r neplit_build neplit_build_C
+          cd neplit_build_C
+          apktool b . --output ../raw_C.apk 2>&1 | tail -5
+          cd ..
+          ls -lh raw_C.apk
+
+      - name: "[C] Python ile temiz ZIP"
+        run: |
+          python3 /tmp/repack.py raw_C.apk clean_C.apk
+          python3 -c "
+          import zipfile
+          with zipfile.ZipFile('clean_C.apk','r') as z:
+              bad = z.testzip()
+              print('ZIP test:', 'TAMAM' if bad is None else f'HATA: {bad}')
+          "
+
+      - name: "[C] zipalign + apksigner"
+        run: |
+          zipalign -f -v -p 4 clean_C.apk aligned_C.apk
+          zipalign -c -v 4 aligned_C.apk && echo "C: zipalign TAMAM" || echo "C: zipalign HATA"
+          apksigner sign \
+            --ks neplit.keystore \
+            --ks-key-alias neplit \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out variant_C.apk \
+            aligned_C.apk
+          apksigner verify --verbose variant_C.apk 2>&1 | grep -E "Verifies|v[123]|Error"
+          ls -lh variant_C.apk
+
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # apkanalyzer ile doğrula
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: "apkanalyzer ile APK doğrulama"
+        run: |
+          # apkanalyzer bul
+          APKAN=$(find $ANDROID_HOME -name "apkanalyzer" -type f 2>/dev/null | head -1)
+          if [ -z "$APKAN" ]; then
+            echo "apkanalyzer bulunamadı, cmdline-tools kuruluyor..."
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmdline-tools;latest" 2>/dev/null || true
+            APKAN=$(find $ANDROID_HOME -name "apkanalyzer" -type f 2>/dev/null | head -1)
+          fi
+          echo "apkanalyzer: $APKAN"
+          for VARIANT in A B C; do
+            APK="variant_${VARIANT}.apk"
+            echo "=== Variant $VARIANT ==="
+            if [ -f "$APK" ]; then
+              if [ -n "$APKAN" ]; then
+                "$APKAN" apk summary "$APK" 2>&1 || echo "apkanalyzer HATA"
+                "$APKAN" manifest print "$APK" 2>&1 | head -3 || true
+              fi
+              echo "Boyut: $(ls -lh $APK | awk '{print $5}')"
+              # ZIP structure son kontrolü
+              python3 -c "
+          import zipfile, sys
+          with zipfile.ZipFile('$APK','r') as z:
+              bad = z.testzip()
+              entries = z.infolist()
+              has_manifest = any(e.filename=='AndroidManifest.xml' for e in entries)
+              has_resources = any(e.filename=='resources.arsc' for e in entries)
+              has_dex = any(e.filename.endswith('.dex') for e in entries)
+              resources = next((e for e in entries if e.filename=='resources.arsc'),None)
+              print(f'  ZIP: {\"TAMAM\" if bad is None else \"HATA:\"+bad}')
+              print(f'  Manifest: {has_manifest}, Resources: {has_resources}, DEX: {has_dex}')
+              if resources:
+                  print(f'  resources.arsc compress={resources.compress_type} (0=STORED bekleniyor)')
+              # Extra field kontrolü
+              bad_extra = [e.filename for e in entries if len(e.extra)>0]
+              print(f'  Extra field olan dosya: {len(bad_extra)}/{len(entries)}')
+          "
+            else
+              echo "ATLANDÎ - dosya yok"
+            fi
+          done
+        continue-on-error: true
+
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # Release'e yükle
+      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: Versiyon belirle
         id: version
         run: |
           DATE=$(date +'%Y%m%d-%H%M%S')
           echo "tag=apk-v${DATE}" >> $GITHUB_OUTPUT
-          echo "name=Neplit APK - ${DATE}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
 
-      - name: GitHub Release oluştur ve APK yükle
+      - name: Dosya adlarını güzelleştir
+        run: |
+          cp variant_A.apk neplit-1-standart.apk
+          cp variant_B.apk neplit-2-orig-manifest.apk
+          cp variant_C.apk neplit-3-eski-aapt.apk
+          ls -lh neplit-*.apk
+
+      - name: Release oluştur — 3 variant yükle
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.name }}
+          name: "Neplit APK ${{ steps.version.outputs.date }} — 3 Variant"
           body: |
-            ## Neplit APK - Otomatik Derleme
+            ## Neplit APK — 3 Farklı Derleme Yöntemi
 
-            Bu APK GitHub Actions tarafından otomatik olarak derlenmiştir.
-            Derleme: apktool 2.9.3 + aapt2 + ZIP repack + zipalign + apksigner (v1+v2+v3)
+            Parse hatası nedeniyle 3 farklı yöntemle derlendi. Lütfen sırayla deneyin:
+
+            | Dosya | Yöntem | Dene |
+            |-------|--------|------|
+            | `neplit-1-standart.apk` | apktool + aapt2 | **1. dene** |
+            | `neplit-2-orig-manifest.apk` | apktool + orijinal binary manifest | **2. dene** |
+            | `neplit-3-eski-aapt.apk` | apktool + eski aapt (aapt2 yok) | **3. dene** |
 
             ### Kurulum
-            1. `neplit-signed.apk` dosyasını indirin
-            2. Telefon ayarlarından **Bilinmeyen kaynaklara izin ver** seçeneğini etkinleştirin
-            3. APK dosyasını açıp kurun
+            1. APK'yı indirin (1 numarasından başlayın)
+            2. Telefon Ayarları → Güvenlik → **Bilinmeyen kaynaklara izin ver** açık olsun
+            3. APK'yı dosya yöneticisinden açıp kurun
 
-            ### Paket Bilgileri
-            - Paket: `com.neplit.app`
-            - Min Android: 7.0 (API 24)
-            - Hedef SDK: Android 16 (API 36)
-            - Sürüm: 2.193.0
-          files: neplit-signed.apk
+            ### Teknik Bilgi
+            - Min Android: 7.0 (API 24) | Hedef: API 36 | Sürüm: 2.193.0
+            - İmza: apksigner v1+v2+v3 | ZIP: Python ile temiz repack
+          files: |
+            neplit-1-standart.apk
+            neplit-2-orig-manifest.apk
+            neplit-3-eski-aapt.apk
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: APK'yı artifact olarak da kaydet (yedek)
+      - name: Artifact yedek
         uses: actions/upload-artifact@v4
         with:
-          name: neplit-apk
-          path: neplit-signed.apk
+          name: neplit-all-variants
+          path: neplit-*.apk
           retention-days: 30
