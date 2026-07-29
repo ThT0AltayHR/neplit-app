@@ -22,7 +22,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: apktool 2.9.3 kur (GitHub releases)
+      - name: apktool 2.9.3 kur
         run: |
           mkdir -p $HOME/apktool
           curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
@@ -33,14 +33,14 @@ jobs:
           echo "$HOME/apktool" >> $GITHUB_PATH
           echo "apktool kuruldu: $(java -jar $HOME/apktool/apktool.jar --version)"
 
-      - name: Android SDK build-tools kur (aapt2 için)
+      - name: Android SDK build-tools kur (aapt2, zipalign, apksigner için)
         uses: android-actions/setup-android@v3
 
-      - name: aapt2 PATH'e ekle
+      - name: build-tools araçlarını PATH'e ekle
         run: |
-          AAPT2=$(find $ANDROID_HOME/build-tools -name "aapt2" | sort -V | tail -1)
-          echo "Bulunan aapt2: $AAPT2"
-          echo "$(dirname $AAPT2)" >> $GITHUB_PATH
+          BT=$(find $ANDROID_HOME/build-tools -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
+          echo "Kullanılan build-tools: $BT"
+          echo "$BT" >> $GITHUB_PATH
 
       - name: Release'ten APK kaynak zip'i indir
         run: |
@@ -51,14 +51,20 @@ jobs:
           echo "Kaynak dosyalar:"
           ls -la neplit_build/
 
-      - name: APK derle (apktool + Android SDK aapt2)
+      - name: APK derle (apktool + aapt2)
         run: |
           cd neplit_build
-          apktool b . --output ../neplit-unsigned.apk --use-aapt2
+          apktool b . --output ../neplit-raw.apk --use-aapt2
           cd ..
-          ls -lh neplit-unsigned.apk
+          ls -lh neplit-raw.apk
 
-      - name: Debug keystore oluştur ve imzala
+      - name: zipalign uygula
+        run: |
+          zipalign -v -p 4 neplit-raw.apk neplit-aligned.apk
+          echo "zipalign tamam"
+          ls -lh neplit-aligned.apk
+
+      - name: Keystore oluştur ve apksigner ile imzala (v1+v2+v3)
         run: |
           keytool -genkey -v \
             -keystore neplit.keystore \
@@ -68,13 +74,18 @@ jobs:
             -storepass android -keypass android \
             -dname "CN=Neplit, OU=Dev, O=Neplit, L=TR, ST=TR, C=TR"
 
-          jarsigner -verbose \
-            -sigalg SHA256withRSA -digestalg SHA-256 \
-            -keystore neplit.keystore \
-            -storepass android -keypass android \
-            neplit-unsigned.apk neplit
+          apksigner sign \
+            --ks neplit.keystore \
+            --ks-key-alias neplit \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out neplit-signed.apk \
+            neplit-aligned.apk
 
-          mv neplit-unsigned.apk neplit-signed.apk
+          apksigner verify --verbose neplit-signed.apk
           ls -lh neplit-signed.apk
 
       - name: Versiyon etiketini belirle
@@ -93,6 +104,7 @@ jobs:
             ## Neplit APK - Otomatik Derleme
 
             Bu APK GitHub Actions tarafından otomatik olarak derlenmiştir.
+            İmzalama: apksigner (v1 + v2 + v3) — Android 7.0+ uyumlu
 
             ### Kurulum
             1. `neplit-signed.apk` dosyasını indirin
