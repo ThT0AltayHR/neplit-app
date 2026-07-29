@@ -1,0 +1,70 @@
+name: Build Neplit APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: apktool indir (v2.9.3)
+        run: |
+          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+            -O /usr/local/bin/apktool
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar \
+            -O /usr/local/bin/apktool.jar
+          chmod +x /usr/local/bin/apktool
+          echo "apktool: $(apktool --version)"
+
+      - name: Release'ten APK kaynak zip'i indir
+        run: |
+          curl -sL \
+            "https://github.com/${{ github.repository }}/releases/download/source-v1/neplit_source.zip" \
+            -o neplit_source.zip
+          unzip -q neplit_source.zip
+          ls -la neplit_build/
+
+      - name: APK derle
+        run: |
+          cd neplit_build
+          apktool b . --output ../neplit-unsigned.apk --use-aapt2
+          cd ..
+          ls -lh neplit-unsigned.apk
+
+      - name: Debug keystore oluştur ve imzala
+        run: |
+          keytool -genkey -v \
+            -keystore neplit.keystore \
+            -alias neplit \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Neplit, OU=Dev, O=Neplit, L=TR, ST=TR, C=TR"
+
+          jarsigner -verbose \
+            -sigalg SHA256withRSA -digestalg SHA-256 \
+            -keystore neplit.keystore \
+            -storepass android -keypass android \
+            neplit-unsigned.apk neplit
+
+          mv neplit-unsigned.apk neplit-signed.apk
+          ls -lh neplit-signed.apk
+
+      - name: APK'yı artifact olarak kaydet
+        uses: actions/upload-artifact@v4
+        with:
+          name: neplit-apk
+          path: neplit-signed.apk
+          retention-days: 30
