@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -74,7 +77,38 @@ jobs:
           mv neplit-unsigned.apk neplit-signed.apk
           ls -lh neplit-signed.apk
 
-      - name: APK'yı artifact olarak kaydet
+      - name: Versiyon etiketini belirle
+        id: version
+        run: |
+          DATE=$(date +'%Y%m%d-%H%M%S')
+          echo "tag=apk-v${DATE}" >> $GITHUB_OUTPUT
+          echo "name=Neplit APK - ${DATE}" >> $GITHUB_OUTPUT
+
+      - name: GitHub Release oluştur ve APK yükle
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          body: |
+            ## Neplit APK - Otomatik Derleme
+
+            Bu APK GitHub Actions tarafından otomatik olarak derlenmiştir.
+
+            ### Kurulum
+            1. `neplit-signed.apk` dosyasını indirin
+            2. Telefon ayarlarından **Bilinmeyen kaynaklara izin ver** seçeneğini etkinleştirin
+            3. APK dosyasını açıp kurun
+
+            ### Paket Bilgileri
+            - Paket: `com.neplit.app`
+            - Min Android: 7.0 (API 24)
+          files: neplit-signed.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: APK'yı artifact olarak da kaydet (yedek)
         uses: actions/upload-artifact@v4
         with:
           name: neplit-apk
