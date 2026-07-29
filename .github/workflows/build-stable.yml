@@ -1,0 +1,313 @@
+name: Build Neplit Stable APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: apktool 2.9.3 kur
+        run: |
+          mkdir -p $HOME/apktool
+          curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
+            -o $HOME/apktool/apktool.jar
+          curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+            -o $HOME/apktool/apktool
+          chmod +x $HOME/apktool/apktool
+          echo "$HOME/apktool" >> $GITHUB_PATH
+
+      - name: Android SDK build-tools kur
+        uses: android-actions/setup-android@v3
+
+      - name: build-tools PATH'e ekle
+        run: |
+          BT=$(find $ANDROID_HOME/build-tools -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
+          echo "Build-tools: $BT"
+          echo "$BT" >> $GITHUB_PATH
+
+      - name: Kaynak zip'i indir ve çıkar
+        run: |
+          curl -L \
+            "https://github.com/${{ github.repository }}/releases/download/source-v1/neplit_source.zip" \
+            -o neplit_source.zip
+          unzip -q neplit_source.zip
+          echo "Kaynak hazır: $(ls neplit_build/)"
+
+      # ─── Split APK kısıtlamalarını kaldır ───────────────────────────────────
+      - name: Manifest'ten split gereksinimlerini kaldır
+        run: |
+          cat > /tmp/fix_manifest.py << 'PYEOF'
+          import xml.etree.ElementTree as ET
+          import re, sys
+
+          manifest_path = "neplit_build/AndroidManifest.xml"
+
+          # XML namespace tanımlarını koru
+          namespaces = {
+              'android': 'http://schemas.android.com/apk/res/android',
+          }
+          for prefix, uri in namespaces.items():
+              ET.register_namespace(prefix, uri)
+
+          # Raw text ile çalış (namespace sorunlarını önlemek için)
+          with open(manifest_path, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          original = content
+
+          # 1. manifest elementinden split attribute'larını kaldır
+          content = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', '', content)
+          content = re.sub(r'\s+android:splitTypes="[^"]*"', '', content)
+
+          # 2. Split ile ilgili meta-data bloklarını kaldır
+          meta_to_remove = [
+              'com.android.vending.splits.required',
+              'com.android.stamp.source',
+              'com.android.stamp.type',
+              'com.android.vending.splits',
+              'com.android.vending.derived.apk.id',
+          ]
+          for key in meta_to_remove:
+              # <meta-data android:name="KEY" ... /> satırlarını kaldır
+              pattern = r'\s*<meta-data[^>]*android:name="' + re.escape(key) + r'"[^/]*/>'
+              content = re.sub(pattern, '', content)
+              # Alternatif format (çok satırlı olabilir)
+              pattern2 = r'\s*<meta-data[^>]*android:name="' + re.escape(key) + r'"[^>]*/>'
+              content = re.sub(pattern2, '', content)
+
+          with open(manifest_path, 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          # Değişiklikleri doğrula
+          removed = []
+          for key in meta_to_remove:
+              if key not in content:
+                  removed.append(f"  ✓ {key} kaldırıldı")
+              else:
+                  removed.append(f"  ✗ {key} hâlâ var!")
+
+          if 'requiredSplitTypes' not in content:
+              removed.append("  ✓ requiredSplitTypes kaldırıldı")
+          else:
+              removed.append("  ✗ requiredSplitTypes hâlâ var!")
+
+          if 'splitTypes' not in content:
+              removed.append("  ✓ splitTypes kaldırıldı")
+
+          print("Manifest düzeltmeleri:")
+          print('\n'.join(removed))
+          PYEOF
+
+          python3 /tmp/fix_manifest.py
+          echo ""
+          echo "=== Manifest özeti (ilk 3 satır) ==="
+          head -3 neplit_build/AndroidManifest.xml | cut -c1-200
+
+      - name: splits0.xml'i temizle
+        run: |
+          cat > neplit_build/res/xml/splits0.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <splits>
+              <module name="">
+              </module>
+          </splits>
+          XMLEOF
+          echo "splits0.xml temizlendi."
+
+      # ─── Keystore oluştur ────────────────────────────────────────────────────
+      - name: Keystore oluştur
+        run: |
+          keytool -genkey -v \
+            -keystore neplit.keystore \
+            -alias neplit \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Neplit,OU=Dev,O=Neplit,L=TR,ST=TR,C=TR"
+
+      # ─── Python repack scripti ───────────────────────────────────────────────
+      - name: Python repack scriptini hazırla
+        run: |
+          cat > /tmp/repack.py << 'PYEOF'
+          import zipfile, os, sys
+
+          input_apk  = sys.argv[1]
+          output_apk = sys.argv[2]
+
+          STORE_NAMES = {'resources.arsc'}
+          STORE_EXTS  = {
+              '.dex', '.so', '.png', '.webp', '.jpg', '.jpeg', '.gif',
+              '.bmp', '.tflite', '.profm', '.prof', '.bundle', '.binarypb',
+              '.mp4', '.mp3', '.ogg', '.wav', '.ttf', '.otf', '.pem',
+          }
+
+          with zipfile.ZipFile(input_apk, 'r') as zin:
+              infos = zin.infolist()
+              print(f"Girdi: {len(infos)} dosya, {os.path.getsize(input_apk)/1024/1024:.1f} MB")
+
+              # resources.arsc en başta olsun (Android gerekliliği)
+              infos.sort(key=lambda x: (
+                  0 if x.filename == 'resources.arsc' else 1,
+                  x.filename
+              ))
+
+              with zipfile.ZipFile(output_apk, 'w', allowZip64=False) as zout:
+                  for info in infos:
+                      data = zin.read(info.filename)
+                      new = zipfile.ZipInfo(info.filename)
+                      new.date_time = (2024, 1, 1, 0, 0, 0)
+                      new.extra     = b''
+                      new.comment   = b''
+                      new.flag_bits = 0
+                      bname = os.path.basename(info.filename)
+                      ext   = os.path.splitext(bname)[1].lower()
+                      if bname in STORE_NAMES or ext in STORE_EXTS:
+                          new.compress_type = zipfile.ZIP_STORED
+                      else:
+                          new.compress_type = zipfile.ZIP_DEFLATED
+                      zout.writestr(new, data)
+
+          out_size = os.path.getsize(output_apk)
+          print(f"Çıktı: {out_size/1024/1024:.1f} MB")
+          print("Repack tamamlandı.")
+          PYEOF
+          echo "Python repack scripti hazır."
+
+      # ─── APK derle (--use-aapt2 + --copy-original) ──────────────────────────
+      - name: apktool ile derle
+        run: |
+          cd neplit_build
+          apktool b . \
+            --output ../raw_neplit.apk \
+            --use-aapt2 \
+            --copy-original \
+            2>&1 | tail -10
+          cd ..
+          echo "Ham APK boyutu: $(du -h raw_neplit.apk | cut -f1)"
+
+      - name: Temiz ZIP oluştur
+        run: |
+          python3 /tmp/repack.py raw_neplit.apk clean_neplit.apk
+          python3 -c "
+          import zipfile
+          with zipfile.ZipFile('clean_neplit.apk','r') as z:
+              bad = z.testzip()
+              entries = z.infolist()
+              has_manifest = any(e.filename=='AndroidManifest.xml' for e in entries)
+              has_resources = any(e.filename=='resources.arsc' for e in entries)
+              has_dex = any(e.filename.endswith('.dex') for e in entries)
+              resources = next((e for e in entries if e.filename=='resources.arsc'), None)
+              split_meta = any('vending.splits' in e.filename or 'vending.derived' in e.filename for e in entries)
+              print(f'ZIP: {\"TAMAM\" if bad is None else \"HATA: \"+bad}')
+              print(f'Manifest: {has_manifest} | Resources: {has_resources} | DEX: {has_dex}')
+              if resources:
+                  print(f'resources.arsc compress={resources.compress_type} (0=STORED bekleniyor)')
+              bad_extra = [e.filename for e in entries if len(e.extra)>0]
+              print(f'Extra field: {len(bad_extra)} dosya')
+          "
+
+      - name: zipalign + apksigner
+        run: |
+          zipalign -f -v -p 4 clean_neplit.apk aligned_neplit.apk
+          zipalign -c -v 4 aligned_neplit.apk && echo "zipalign: TAMAM" || echo "zipalign: HATA"
+          apksigner sign \
+            --ks neplit.keystore \
+            --ks-key-alias neplit \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out neplit-stable.apk \
+            aligned_neplit.apk
+          echo ""
+          echo "=== APK İmza Doğrulama ==="
+          apksigner verify --verbose neplit-stable.apk 2>&1 | grep -E "Verifies|v[123]|Error|WARNING"
+          echo ""
+          echo "=== APK Özeti ==="
+          echo "Boyut: $(du -h neplit-stable.apk | cut -f1)"
+
+      # ─── Manifest doğrulama ──────────────────────────────────────────────────
+      - name: APK içindeki manifest'i doğrula
+        run: |
+          APKAN=$(find $ANDROID_HOME -name "apkanalyzer" -type f 2>/dev/null | head -1)
+          if [ -n "$APKAN" ]; then
+            echo "=== APK Özeti ==="
+            "$APKAN" apk summary neplit-stable.apk 2>&1 || true
+            echo ""
+            echo "=== Manifest Özeti ==="
+            "$APKAN" manifest print neplit-stable.apk 2>&1 | grep -E "manifest|minSdk|targetSdk|required|split" | head -10 || true
+          else
+            echo "apkanalyzer bulunamadı — ZIP kontrolü yapılıyor"
+            python3 -c "
+          import zipfile
+          with zipfile.ZipFile('neplit-stable.apk','r') as z:
+              manifest_data = z.read('AndroidManifest.xml')
+              print(f'AndroidManifest.xml: {len(manifest_data)} byte (binary format)')
+              print('Split gereksinim kontrolü: binary manifest — apkanalyzer gerekmekte')
+          "
+          fi
+        continue-on-error: true
+
+      # ─── Release oluştur ─────────────────────────────────────────────────────
+      - name: Versiyon belirle
+        id: version
+        run: |
+          DATE=$(date +'%Y%m%d-%H%M%S')
+          echo "tag=stable-v${DATE}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+
+      - name: Release oluştur — Kararlı sürüm
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Neplit Stable ${{ steps.version.outputs.date }}"
+          body: |
+            ## Neplit Kararlı Sürüm — ${{ steps.version.outputs.date }}
+
+            ### ✅ Bu sürümde düzeltilenler
+            - **Split APK uyumsuzluğu giderildi** — "Bu uygulama telefonunuzla uyumlu değil" hatası düzeltildi
+            - `android:requiredSplitTypes` kaldırıldı (Play Store split gereksinimi)
+            - `com.android.vending.splits.required` meta-data kaldırıldı
+            - Bağımsız, tek APK dosyası olarak yeniden derlendi
+
+            ### 📱 Kurulum
+            1. `neplit-stable.apk` dosyasını indirin
+            2. **Telefon Ayarları → Güvenlik → Bilinmeyen kaynaklara izin ver** açık olsun
+            3. APK'yı dosya yöneticisinden açıp kurun
+
+            ### 📋 Teknik Bilgi
+            | Alan | Değer |
+            |------|-------|
+            | Paket | `com.neplit.app` |
+            | Min Android | 7.0 (API 24) |
+            | Hedef SDK | Android 16 (API 36) |
+            | Sürüm | 2.193.0 |
+            | İmza | v1 + v2 + v3 |
+
+          files: neplit-stable.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Artifact yedek
+        uses: actions/upload-artifact@v4
+        with:
+          name: neplit-stable
+          path: neplit-stable.apk
+          retention-days: 30
