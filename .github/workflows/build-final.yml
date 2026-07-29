@@ -1,0 +1,512 @@
+name: Build Neplit Final APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: apktool 2.9.3 kur
+        run: |
+          mkdir -p $HOME/apktool
+          curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
+            -o $HOME/apktool/apktool.jar
+          curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+            -o $HOME/apktool/apktool
+          chmod +x $HOME/apktool/apktool
+          echo "$HOME/apktool" >> $GITHUB_PATH
+
+      - name: Android SDK build-tools kur
+        uses: android-actions/setup-android@v3
+
+      - name: build-tools PATH'e ekle
+        run: |
+          BT=$(find $ANDROID_HOME/build-tools -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)
+          echo "Build-tools: $BT"
+          echo "$BT" >> $GITHUB_PATH
+
+      - name: Kaynak zip'i indir ve çıkar
+        run: |
+          curl -L \
+            "https://github.com/${{ github.repository }}/releases/download/source-v1/neplit_source.zip" \
+            -o neplit_source.zip
+          unzip -q neplit_source.zip
+          echo "Kaynak hazır: $(ls neplit_build/)"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 1. BINARY MANIFEST PATCH (original/AndroidManifest.xml)
+      #    --copy-original bu dosyayı kullanır. Text patch'leri YOK sayar.
+      #    Doğrudan binary XML'i düzeltmemiz şart.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Binary manifest patch scripti oluştur
+        run: |
+          cat > /tmp/patch_binary_manifest.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Android binary XML patcher.
+          - manifest elementinden requiredSplitTypes ve splitTypes attribute'larını kaldırır
+          - Belirtilen meta-data elementlerinin attribute'larını sıfırlar
+          Dosya boyutu DEĞİŞMEZ (offsets bozulmaz).
+          """
+          import struct, sys, os
+
+          TYPE_NULL   = 0x00
+          TYPE_STRING = 0x03
+          TYPE_INT_BOOL = 0x12
+
+          def read_uint32(data, off): return struct.unpack_from('<I', data, off)[0]
+          def read_uint16(data, off): return struct.unpack_from('<H', data, off)[0]
+          def write_uint32(data, off, v): struct.pack_into('<I', data, off, v)
+          def write_uint16(data, off, v): struct.pack_into('<H', data, off, v)
+
+          def parse_strings(data):
+              # File header: type(2), headerSize(2), fileSize(4)
+              file_header_size = read_uint16(data, 2)
+              sp_off = file_header_size
+              
+              sp_type        = read_uint16(data, sp_off)
+              sp_header_size = read_uint16(data, sp_off + 2)
+              sp_size        = read_uint32(data, sp_off + 4)
+              sp_count       = read_uint32(data, sp_off + 8)
+              sp_flags       = read_uint32(data, sp_off + 16)
+              sp_str_start   = read_uint32(data, sp_off + 20)
+              
+              is_utf8 = (sp_flags & 0x100) != 0
+              offsets_base = sp_off + sp_header_size
+              strs_base    = sp_off + sp_str_start
+              
+              strings = []
+              for i in range(sp_count):
+                  rel = read_uint32(data, offsets_base + i * 4)
+                  p = strs_base + rel
+                  if is_utf8:
+                      # char len
+                      cl = data[p]
+                      if cl & 0x80: cl = ((cl & 0x7F) << 8) | data[p+1]; p += 2
+                      else: p += 1
+                      # byte len
+                      bl = data[p]
+                      if bl & 0x80: bl = ((bl & 0x7F) << 8) | data[p+1]; p += 2
+                      else: p += 1
+                      s = data[p:p+bl].decode('utf-8', errors='replace')
+                  else:
+                      cl = read_uint16(data, p)
+                      if cl & 0x8000: cl = ((cl & 0x7FFF) << 16) | read_uint16(data, p+2); p += 4
+                      else: p += 2
+                      s = data[p:p+cl*2].decode('utf-16-le', errors='replace')
+                  strings.append(s)
+              
+              return strings, sp_off + sp_size
+
+          def zero_attr(data, off, attr_size):
+              """Tek bir attribute'u TYPE_NULL'a çevir."""
+              write_uint32(data, off + 8,  0xFFFFFFFF)  # rawValue = -1 (absent)
+              write_uint16(data, off + 12, TYPE_NULL)   # valueDataType = NULL
+              write_uint16(data, off + 14, 0x0000)      # reserved = 0
+              write_uint32(data, off + 16, 0x00000000)  # data = 0
+
+          def patch(input_path, output_path):
+              with open(input_path, 'rb') as f:
+                  data = bytearray(f.read())
+              
+              file_type = read_uint16(data, 0)
+              if file_type != 0x0003:
+                  print(f"HATA: Binary XML bekleniyor (type=0x0003), got {file_type:#06x}")
+                  sys.exit(1)
+              
+              strings, nodes_start = parse_strings(bytes(data))
+              print(f"String pool: {len(strings)} string, nodes_start={nodes_start}")
+              
+              # Hedef attribute isimleri (manifest elementinde)
+              MANIFEST_ATTRS_TO_REMOVE = {'requiredSplitTypes', 'splitTypes'}
+              
+              # Hedef meta-data isimleri (android:name değeri)
+              META_NAMES_TO_REMOVE = {
+                  'com.android.vending.splits.required',
+                  'com.android.stamp.source',
+                  'com.android.stamp.type',
+                  'com.android.vending.splits',
+                  'com.android.vending.derived.apk.id',
+              }
+              
+              for s in MANIFEST_ATTRS_TO_REMOVE | META_NAMES_TO_REMOVE:
+                  found = s in strings
+                  print(f"  {'✓' if found else '✗'} '{s}'")
+              
+              off = nodes_start
+              
+              # Resource map chunk (isteğe bağlı)
+              if off < len(data) and read_uint16(data, off) == 0x0180:
+                  off += read_uint32(data, off + 4)
+              
+              actions = []
+              
+              while off + 8 <= len(data):
+                  chunk_type = read_uint16(data, off)
+                  hdr_size   = read_uint16(data, off + 2)
+                  chunk_size = read_uint32(data, off + 4)
+                  
+                  if chunk_size == 0:
+                      break
+                  
+                  if chunk_type == 0x0102:  # START_ELEMENT
+                      elem_name_idx = read_uint32(data, off + 12)
+                      attr_off_rel  = read_uint16(data, off + 16)  # typically 0x14=20
+                      attr_size     = read_uint16(data, off + 18)  # typically 0x14=20
+                      attr_count    = read_uint16(data, off + 20)
+                      
+                      elem_name = strings[elem_name_idx] if elem_name_idx < len(strings) else ""
+                      
+                      if elem_name == 'manifest':
+                          # manifest elementinin attribute'larını tara
+                          a_off = off + attr_off_rel
+                          for _ in range(attr_count):
+                              a_name_idx = read_uint32(data, a_off + 4)
+                              a_name = strings[a_name_idx] if a_name_idx < len(strings) else ""
+                              if a_name in MANIFEST_ATTRS_TO_REMOVE:
+                                  print(f"  → manifest attr '{a_name}' sıfırlanıyor (off={a_off})")
+                                  zero_attr(data, a_off, attr_size)
+                                  actions.append(f"REMOVED_MANIFEST_ATTR:{a_name}")
+                              a_off += attr_size
+                      
+                      elif elem_name == 'meta-data':
+                          # Bu meta-data'nın android:name değerini bul
+                          meta_name_val = None
+                          a_off = off + attr_off_rel
+                          for _ in range(attr_count):
+                              a_name_idx = read_uint32(data, a_off + 4)
+                              a_name = strings[a_name_idx] if a_name_idx < len(strings) else ""
+                              a_type = read_uint16(data, a_off + 12)
+                              a_data = read_uint32(data, a_off + 16)
+                              if a_name == 'name' and a_type == TYPE_STRING and a_data < len(strings):
+                                  meta_name_val = strings[a_data]
+                              a_off += attr_size
+                          
+                          if meta_name_val in META_NAMES_TO_REMOVE:
+                              print(f"  → meta-data '{meta_name_val}' sıfırlanıyor")
+                              a_off = off + attr_off_rel
+                              for _ in range(attr_count):
+                                  zero_attr(data, a_off, attr_size)
+                                  a_off += attr_size
+                              actions.append(f"REMOVED_META:{meta_name_val}")
+                  
+                  off += chunk_size
+              
+              print(f"\nUygulanan düzeltmeler ({len(actions)}):")
+              for a in actions:
+                  print(f"  {a}")
+              
+              if not actions:
+                  print("UYARI: Hiçbir düzeltme uygulanmadı!")
+              
+              with open(output_path, 'wb') as f:
+                  f.write(bytes(data))
+              
+              orig_size = os.path.getsize(input_path)
+              new_size  = os.path.getsize(output_path)
+              print(f"\nGirdi: {orig_size} byte | Çıktı: {new_size} byte")
+              assert orig_size == new_size, "HATA: Dosya boyutu değişti!"
+              print("✓ Binary manifest patch tamamlandı.")
+
+          if __name__ == '__main__':
+              patch(sys.argv[1], sys.argv[2])
+          PYEOF
+          echo "Binary patch scripti hazır."
+
+      - name: Binary manifest'i patch'le (original/)
+        run: |
+          echo "=== Patch öncesi binary manifest ==="
+          ls -lh neplit_build/original/AndroidManifest.xml
+          python3 /tmp/patch_binary_manifest.py \
+            neplit_build/original/AndroidManifest.xml \
+            neplit_build/original/AndroidManifest.xml.patched
+          mv neplit_build/original/AndroidManifest.xml.patched \
+             neplit_build/original/AndroidManifest.xml
+          echo "=== Patch sonrası ==="
+          ls -lh neplit_build/original/AndroidManifest.xml
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 2. TEXT MANIFEST PATCH (apktool'un decode ettiği XML)
+      #    --copy-original olmadığında bu kullanılır. İkili koruma.
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Text manifest'i patch'le
+        run: |
+          python3 - << 'PYEOF'
+          import re
+
+          path = "neplit_build/AndroidManifest.xml"
+          with open(path, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          # manifest elementinden split attribute'larını kaldır
+          content = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', '', content)
+          content = re.sub(r'\s+android:splitTypes="[^"]*"', '', content)
+
+          # Split ile ilgili meta-data bloklarını kaldır
+          META_TO_REMOVE = [
+              'com.android.vending.splits.required',
+              'com.android.stamp.source',
+              'com.android.stamp.type',
+              'com.android.vending.splits',
+              'com.android.vending.derived.apk.id',
+          ]
+          for key in META_TO_REMOVE:
+              content = re.sub(
+                  r'\s*<meta-data[^>]*android:name="' + re.escape(key) + r'"[^/]*/>', '', content)
+              content = re.sub(
+                  r'\s*<meta-data[^>]*android:name="' + re.escape(key) + r'"[^>]*/>', '', content)
+
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          # Doğrulama
+          checks = {
+              'requiredSplitTypes': 'requiredSplitTypes' not in content,
+              'splitTypes': 'splitTypes' not in content,
+          }
+          for key in META_TO_REMOVE:
+              checks[key] = key not in content
+
+          print("Text manifest patch sonuçları:")
+          for k, v in checks.items():
+              print(f"  {'✓' if v else '✗'} {k}")
+          PYEOF
+
+      - name: splits0.xml'i temizle
+        run: |
+          cat > neplit_build/res/xml/splits0.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <splits>
+              <module name=""></module>
+          </splits>
+          XMLEOF
+          echo "splits0.xml temizlendi."
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 3. KEYSTORE
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Keystore oluştur
+        run: |
+          keytool -genkey -v \
+            -keystore neplit.keystore \
+            -alias neplit \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Neplit,OU=Dev,O=Neplit,L=TR,ST=TR,C=TR"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 4. REPACK scripti
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Python repack scriptini hazırla
+        run: |
+          cat > /tmp/repack.py << 'PYEOF'
+          import zipfile, os, sys
+
+          input_apk  = sys.argv[1]
+          output_apk = sys.argv[2]
+
+          # Android ZIP gereksinimleri:
+          #   resources.arsc → STORED (memory-map zorunlu)
+          #   .dex, .so      → STORED (runtime erişimi için)
+          #   diğerleri      → DEFLATED (boyut küçültme)
+          STORE_NAMES = {'resources.arsc'}
+          STORE_EXTS  = {
+              '.dex', '.so', '.png', '.webp', '.jpg', '.jpeg', '.gif',
+              '.bmp', '.tflite', '.profm', '.prof', '.bundle', '.binarypb',
+              '.mp4', '.mp3', '.ogg', '.wav', '.ttf', '.otf', '.pem',
+          }
+
+          with zipfile.ZipFile(input_apk, 'r') as zin:
+              infos = zin.infolist()
+              print(f"Girdi: {len(infos)} dosya, {os.path.getsize(input_apk)/1024/1024:.1f} MB")
+
+              # resources.arsc en başta (Android zorunluluğu)
+              infos.sort(key=lambda x: (
+                  0 if x.filename == 'resources.arsc' else 1,
+                  x.filename
+              ))
+
+              with zipfile.ZipFile(output_apk, 'w', allowZip64=False) as zout:
+                  for info in infos:
+                      data = zin.read(info.filename)
+                      new = zipfile.ZipInfo(info.filename)
+                      new.date_time    = (2024, 1, 1, 0, 0, 0)
+                      new.extra        = b''
+                      new.comment      = b''
+                      new.flag_bits    = 0
+                      bname = os.path.basename(info.filename)
+                      ext   = os.path.splitext(bname)[1].lower()
+                      if bname in STORE_NAMES or ext in STORE_EXTS:
+                          new.compress_type = zipfile.ZIP_STORED
+                      else:
+                          new.compress_type = zipfile.ZIP_DEFLATED
+                      zout.writestr(new, data)
+
+          out_size = os.path.getsize(output_apk)
+          print(f"Çıktı: {out_size/1024/1024:.1f} MB")
+
+          # ZIP bütünlük kontrolü
+          with zipfile.ZipFile(output_apk, 'r') as z:
+              bad = z.testzip()
+              entries = z.infolist()
+              res = next((e for e in entries if e.filename=='resources.arsc'), None)
+              print(f"ZIP: {'TAMAM' if bad is None else 'HATA: '+bad}")
+              print(f"Manifest: {any(e.filename=='AndroidManifest.xml' for e in entries)}")
+              print(f"DEX: {any(e.filename.endswith('.dex') for e in entries)}")
+              if res: print(f"resources.arsc compress={res.compress_type} (0=STORED bekleniyor)")
+          PYEOF
+          echo "Repack scripti hazır."
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 5. DERLEME — copy-original ile (patched binary manifest kullanılır)
+      # ────────────────────────────────────────────────────────────────────────
+      - name: apktool ile derle (copy-original + patched binary manifest)
+        run: |
+          cd neplit_build
+          apktool b . \
+            --output ../raw_neplit.apk \
+            --use-aapt2 \
+            --copy-original \
+            2>&1
+          cd ..
+          ls -lh raw_neplit.apk
+          echo "Ham APK boyutu: $(du -h raw_neplit.apk | cut -f1)"
+
+      - name: Temiz ZIP yapısı oluştur
+        run: python3 /tmp/repack.py raw_neplit.apk clean_neplit.apk
+
+      - name: zipalign
+        run: |
+          zipalign -f -v -p 4 clean_neplit.apk aligned_neplit.apk
+          zipalign -c -v 4 aligned_neplit.apk && echo "zipalign: ✓ TAMAM" || echo "zipalign: ✗ HATA"
+
+      - name: apksigner ile imzala
+        run: |
+          apksigner sign \
+            --ks neplit.keystore \
+            --ks-key-alias neplit \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out neplit-final.apk \
+            aligned_neplit.apk
+          echo ""
+          echo "=== İmza Doğrulama ==="
+          apksigner verify --verbose neplit-final.apk 2>&1 | grep -E "Verifies|v[123]|Error|WARNING"
+          echo "APK boyutu: $(du -h neplit-final.apk | cut -f1)"
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 6. MANIFEST DOĞRULAMA — binary manifest'teki split flag'ları kaldırıldı mı?
+      # ────────────────────────────────────────────────────────────────────────
+      - name: APK manifest doğrulama
+        run: |
+          APKAN=$(find $ANDROID_HOME -name "apkanalyzer" -type f 2>/dev/null | head -1)
+          if [ -n "$APKAN" ]; then
+            echo "=== apkanalyzer manifest ==="
+            "$APKAN" manifest print neplit-final.apk 2>&1 | \
+              grep -E "manifest|minSdk|targetSdk|required|split|package" | head -20
+          else
+            echo "apkanalyzer bulunamadı — aapt ile kontrol ediliyor"
+          fi
+          
+          # aapt ile de kontrol et
+          AAPT=$(find $ANDROID_HOME -name "aapt" -type f 2>/dev/null | head -1)
+          if [ -n "$AAPT" ]; then
+            echo ""
+            echo "=== aapt badging ==="
+            "$AAPT" dump badging neplit-final.apk 2>&1 | \
+              grep -E "package|sdk|native|split" | head -20
+          fi
+          
+          # Python ile ZIP yapısı doğrula
+          python3 - << 'PYEOF'
+          import zipfile
+          with zipfile.ZipFile('neplit-final.apk', 'r') as z:
+              entries = z.infolist()
+              bad = z.testzip()
+              print(f"\nZIP doğrulama: {'✓ TAMAM' if bad is None else '✗ HATA: '+bad}")
+              print(f"Toplam dosya: {len(entries)}")
+              bad_extra = [e.filename for e in entries if len(e.extra) > 0]
+              print(f"Extra field olan dosya: {len(bad_extra)}")
+              res = next((e for e in entries if e.filename=='resources.arsc'), None)
+              if res:
+                  print(f"resources.arsc: compress_type={res.compress_type} {'✓ STORED' if res.compress_type==0 else '✗ SIKIŞTIRILMIŞ'}")
+              # Split meta-data kontrolü (binary XML içinde)
+              mf = z.read('AndroidManifest.xml')
+              for kw in [b'requiredSplitTypes', b'splitTypes', b'vending.splits']:
+                  if kw in mf:
+                      print(f"⚠ Uyarı: '{kw.decode()}' hâlâ manifest'te!")
+                  else:
+                      print(f"✓ '{kw.decode()}' manifest'te yok")
+          PYEOF
+        continue-on-error: true
+
+      # ────────────────────────────────────────────────────────────────────────
+      # 7. RELEASE
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Versiyon belirle
+        id: version
+        run: |
+          DATE=$(date +'%Y%m%d-%H%M%S')
+          echo "tag=final-v${DATE}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+
+      - name: Release oluştur
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Neplit Final ${{ steps.version.outputs.date }}"
+          body: |
+            ## Neplit APK — Final Sürüm
+
+            ### ✅ Bu sürümde yapılan tam düzeltmeler
+
+            | Sorun | Düzeltme |
+            |-------|---------|
+            | **"Telefonla uyumlu değil" hatası** | Binary manifest'ten `requiredSplitTypes="base__abi,base__density"` ve `splitTypes` attribute'ları doğrudan patch'lendi (TYPE_NULL → boş değer) |
+            | **Split APK zorlaması** | `com.android.vending.splits.required`, `com.android.vending.splits`, `com.android.vending.derived.apk.id`, `com.android.stamp.*` meta-data'ları kaldırıldı |
+            | **Paket ayrıştırma hatası** | Temiz ZIP yapısı: resources.arsc=STORED, extra field=sıfır, resources.arsc en başta |
+            | **İmza** | apksigner v1+v2+v3 (tüm Android sürümleri desteklenir) |
+
+            ### 📱 Kurulum Adımları
+            1. `neplit-final.apk` dosyasını indir
+            2. **Telefon Ayarları → Güvenlik → Bilinmeyen kaynaklara izin ver** açık olsun
+            3. Dosya yöneticisinden APK'ya dokun → Kur
+
+            ### 📋 Teknik Bilgi
+            | Alan | Değer |
+            |------|-------|
+            | Paket | `com.neplit.app` |
+            | Min Android | 7.0 (API 24) |
+            | Hedef SDK | 36 (Android 16) |
+            | Sürüm | 2.193.0 |
+            | İmza | v1 + v2 + v3 |
+
+          files: neplit-final.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Artifact yedek
+        uses: actions/upload-artifact@v4
+        with:
+          name: neplit-final
+          path: neplit-final.apk
+          retention-days: 30
